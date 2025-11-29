@@ -1,4 +1,6 @@
-import gradio as gr
+import warnings
+warnings.filterwarnings("ignore")
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,35 +8,29 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 from PIL import Image
 
+import gradio as gr
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import (
-    accuracy_score, classification_report, confusion_matrix,
-    RocCurveDisplay, PrecisionRecallDisplay
-)
-
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.naive_bayes import GaussianNB
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.svm import SVC
-from sklearn.neighbors import KNeighborsClassifier
-import xgboost as xgb
-
-import os
-import warnings
-warnings.filterwarnings("ignore")
-
 
 # -----------------------------
-# Helpers (plots -> PIL images)
+# Globals to hold trained model
 # -----------------------------
-def fig_to_pil(fig, dpi=150, tight=True):
+trained_artifacts = {
+    "model": None,
+    "feature_cols": None,
+    "income_le": None,
+    "income_choices": [],
+}
+
+# -----------------------------
+# Plot helpers
+# -----------------------------
+def fig_to_pil(fig):
     buf = BytesIO()
-    if tight:
-        fig.tight_layout()
-    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    fig.savefig(buf, format="png", bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return Image.open(buf)
@@ -42,130 +38,118 @@ def fig_to_pil(fig, dpi=150, tight=True):
 
 def plot_confusion_matrix(cm, title):
     fig, ax = plt.subplots(figsize=(4.5, 3.8))
-    ax.imshow(cm, interpolation="nearest", cmap="Blues")
+    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
     ax.set_title(title)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
     ax.set_xticks([0, 1])
     ax.set_yticks([0, 1])
     ax.set_xticklabels(["Fail", "Success"])
     ax.set_yticklabels(["Fail", "Success"])
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("Actual")
 
-    # numbers
-    for (i, j), v in np.ndenumerate(cm):
-        ax.text(j, i, f"{v}", ha="center", va="center", color="black", fontsize=12)
-    return fig_to_pil(fig)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, cm[i, j], ha="center", va="center", color="black")
 
-
-def plot_bar(names, values, title, ylabel="Accuracy"):
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.bar(names, values)
-    ax.set_ylim(0, 1)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.set_xticklabels(names, rotation=45, ha="right")
-    return fig_to_pil(fig)
-
-
-def plot_feature_importance_or_coef(model, feat_names, title):
-    fig, ax = plt.subplots(figsize=(7, 4))
-    if hasattr(model, "feature_importances_"):
-        vals = model.feature_importances_
-        ax.bar(feat_names, vals)
-        ax.set_title(title)
-        ax.set_ylabel("Importance")
-    elif hasattr(model, "coef_"):
-        coefs = model.coef_[0] if model.coef_.ndim > 1 else model.coef_
-        ax.bar(feat_names, coefs)
-        ax.set_title(title)
-        ax.set_ylabel("Coefficient")
-    else:
-        plt.close(fig)
-        return None
-    ax.set_xticklabels(feat_names, rotation=45, ha="right")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     return fig_to_pil(fig)
 
+# -----------------------------
+# Preprocessing (matches thesis)
+# -----------------------------
+EXPECTED_COLS = [
+    "Age",
+    "Study hours per week",
+    "Family monthly income",
+    "Confidence",
+    "Frequency of attendance",
+    "Punctuality",
+    "Class engagement",
+    "Frequency of stress",
+    "Performance",
+]
 
-# -----------------------------
-# Data preprocessing (matches your notebook)
-# -----------------------------
+
+def study_hours_to_num(x):
+    if pd.isna(x):
+        return 0
+    xx = str(x).lower()
+    if "less than 5" in xx:
+        return 3
+    if "5 - 10" in xx:
+        return 7.5
+    if "11 - 15" in xx:
+        return 13
+    if "more than 15" in xx:
+        return 16
+    try:
+        return float(xx)
+    except Exception:
+        return 0
+
+
 def preprocess_df(df_raw):
     df = df_raw.copy()
     df.columns = df.columns.str.strip()
 
-    # target
+    missing = [c for c in EXPECTED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "Missing required column(s): "
+            + ", ".join(missing)
+            + "\nFound columns: "
+            + ", ".join(df.columns)
+        )
+
+    # Target mapping: Good/Excellent -> 1, others -> 0
     def map_performance(perf):
-        if isinstance(perf, str) and ("Good" in perf or "Excellent" in perf):
+        if isinstance(perf, str) and ("good" in perf.lower() or "excellent" in perf.lower()):
             return 1
         return 0
 
-    if "Performance" not in df.columns:
-        raise ValueError("Column 'Performance' not found in CSV.")
-
-    df["target"] = df["Performance"].apply(map_performance)
+    df["target"] = df["Performance"].apply(map_performance).astype(int)
 
     # Age
-    if "Age" not in df.columns:
-        raise ValueError("Column 'Age' not found in CSV.")
     df["Age"] = pd.to_numeric(df["Age"], errors="coerce")
     df["Age"] = df["Age"].fillna(df["Age"].median())
 
-    # Study hours
-    if "Study hours per week" not in df.columns:
-        raise ValueError("Column 'Study hours per week' not found in CSV.")
-
-    def study_hours_to_num(x):
-        if pd.isna(x):
-            return 0
-        x = str(x).lower()
-        if "less than 5" in x:
-            return 3
-        elif "5 - 10" in x:
-            return 7.5
-        elif "11 - 15" in x:
-            return 13
-        elif "more than 15" in x:
-            return 16
-        else:
-            try:
-                return float(x)
-            except Exception:
-                return 0
-
+    # Study hours per week -> numeric
     df["Study_hours"] = df["Study hours per week"].apply(study_hours_to_num)
 
-    # Income (label encode)
-    if "Family monthly income" not in df.columns:
-        raise ValueError("Column 'Family monthly income' not found in CSV.")
+    # Family monthly income -> clean + label encode
     df["Family monthly income"] = (
-        df["Family monthly income"].astype(str).str.replace("\xa0", " ").str.strip().str.lower()
+        df["Family monthly income"]
+        .astype(str)
+        .str.replace("\xa0", " ")
+        .str.strip()
+        .str.lower()
     )
     income_le = LabelEncoder()
     df["Income_code"] = income_le.fit_transform(df["Family monthly income"])
+    income_choices = sorted(df["Family monthly income"].unique())
 
     # Confidence
-    if "Confidence" not in df.columns:
-        raise ValueError("Column 'Confidence' not found in CSV.")
-    confidence_map = {"very confident": 3, "somewhat confident": 2, "unsure": 1, "not confident": 0}
+    confidence_map = {
+        "very confident": 3,
+        "somewhat confident": 2,
+        "unsure": 1,
+        "not confident": 0,
+    }
     df["Confidence"] = df["Confidence"].astype(str).str.lower()
     df["Confidence_code"] = df["Confidence"].map(confidence_map).fillna(1)
 
-    # Attendance
-    if "Frequency of attendance" not in df.columns:
-        raise ValueError("Column 'Frequency of attendance' not found in CSV.")
+    # Frequency of attendance
     attendance_map = {
         "always (0 - 1 absence per month)": 3,
         "frequently (2 - 4 absences per month)": 2,
-        "sometimes (5 - 7 absences per month)": 1,
-        "rarely (more than 7 absences per month)": 0,
+        "occasionally (5 - 8 absences per month)": 1,
+        "rarely (more than 8 absences per month)": 0,
     }
     df["Frequency of attendance"] = df["Frequency of attendance"].astype(str).str.lower()
     df["Attendance_code"] = df["Frequency of attendance"].map(attendance_map).fillna(1)
 
     # Punctuality
-    if "Punctuality" not in df.columns:
-        raise ValueError("Column 'Punctuality' not found in CSV.")
     punctuality_map = {
         "always on time": 3,
         "occasionally late": 2,
@@ -175,9 +159,7 @@ def preprocess_df(df_raw):
     df["Punctuality"] = df["Punctuality"].astype(str).str.lower()
     df["Punctuality_code"] = df["Punctuality"].map(punctuality_map).fillna(1)
 
-    # Engagement
-    if "Class engagement" not in df.columns:
-        raise ValueError("Column 'Class engagement' not found in CSV.")
+    # Class engagement
     engagement_map = {
         "very engaged": 3,
         "moderately engaged": 2,
@@ -187,10 +169,13 @@ def preprocess_df(df_raw):
     df["Class engagement"] = df["Class engagement"].astype(str).str.lower()
     df["Engagement_code"] = df["Class engagement"].map(engagement_map).fillna(1)
 
-    # Stress
-    if "Frequency of stress" not in df.columns:
-        raise ValueError("Column 'Frequency of stress' not found in CSV.")
-    stress_map = {"always": 3, "frequently": 2, "sometimes": 1, "rarely": 0}
+    # Frequency of stress
+    stress_map = {
+        "always": 3,
+        "frequently": 2,
+        "sometimes": 1,
+        "rarely": 0,
+    }
     df["Frequency of stress"] = df["Frequency of stress"].astype(str).str.lower()
     df["Stress_code"] = df["Frequency of stress"].map(stress_map).fillna(1)
 
@@ -206,59 +191,31 @@ def preprocess_df(df_raw):
     ]
 
     X = df[feature_cols]
-    y = df["target"].astype(int)
+    y = df["target"]
 
-    return X, y, feature_cols
-
-
-# ---------------------------------------
-# Build chosen sklearn/xgb models
-# ---------------------------------------
-def build_models(use_class_weight=False):
-    # class_weight only for certain models
-    cw = "balanced" if use_class_weight else None
-
-    models = {
-        "LDA": LinearDiscriminantAnalysis(),
-        "AdaBoost": AdaBoostClassifier(random_state=42),
-        "XGBoost": xgb.XGBClassifier(
-            eval_metric="logloss",
-            random_state=42,
-            n_estimators=200,
-            max_depth=3,
-            learning_rate=0.1,
-            subsample=0.9,
-            colsample_bytree=0.9,
-        ),
-        "RandomForest": RandomForestClassifier(random_state=42, n_estimators=300),
-        "LogisticRegression": LogisticRegression(max_iter=2000, random_state=42, class_weight=cw),
-        "NaiveBayes": GaussianNB(),
-        "DecisionTree": DecisionTreeClassifier(random_state=42, class_weight=cw),
-        "SVM": SVC(probability=True, random_state=42, class_weight=cw),
-        "KNN": KNeighborsClassifier(),
-    }
-    return models
+    return X, y, feature_cols, income_le, income_choices
 
 
-# ---------------------------------------
-# Core run: train, evaluate, collect plots
-# ---------------------------------------
-def run_pipeline(file_obj, selected_models, use_class_weight):
+# -----------------------------
+# 1) Train & evaluate LDA
+# -----------------------------
+def train_lda(file_obj):
     if file_obj is None:
-        raise gr.Error("Please upload a CSV file first.")
+        return "Please upload your survey CSV first.", None, "No report yet."
 
-    # Read CSV to df
+    # Load CSV (Render/Gradio sometimes gives .name, sometimes file-like)
     try:
         df = pd.read_csv(file_obj.name)
     except Exception:
-        # gradio File objects sometimes need .read() buffer
         file_obj.seek(0)
         df = pd.read_csv(file_obj)
 
-    # preprocess
-    X, y, feat_names = preprocess_df(df)
+    try:
+        X, y, feat_cols, income_le, income_choices = preprocess_df(df)
+    except Exception as e:
+        return f"❌ Preprocessing error: {e}", None, "No report due to preprocessing error."
 
-    # split 60/20/20 with fixed seed like your code
+    # 60/20/20 stratified split
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.4, stratify=y, random_state=42
     )
@@ -266,165 +223,269 @@ def run_pipeline(file_obj, selected_models, use_class_weight):
         X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42
     )
 
-    # build models
-    all_models = build_models(use_class_weight)
-    if not selected_models:
-        # default: use all
-        selected_models = list(all_models.keys())
+    # Train LDA
+    lda = LinearDiscriminantAnalysis()
+    lda.fit(X_train, y_train)
 
-    # collect results
-    summary_rows = []
-    panels = {}  # stored in State: per-model images/metrics for detail tab
-    test_bars = []
-    test_bar_names = []
+    # Evaluate
+    y_val_pred = lda.predict(X_val)
+    y_test_pred = lda.predict(X_test)
 
-    for name in selected_models:
-        model = all_models[name]
+    val_acc = accuracy_score(y_val, y_val_pred)
+    test_acc = accuracy_score(y_test, y_test_pred)
 
-        # fit once (not epoch loop; dashboards should be fast)
-        model.fit(X_train, y_train)
+    cm_test = confusion_matrix(y_test, y_test_pred)
+    cm_img = plot_confusion_matrix(cm_test, "Test Confusion Matrix — LDA")
 
-        # validation metrics
-        yv = model.predict(X_val)
-        val_acc = accuracy_score(y_val, yv)
+    report = classification_report(y_test, y_test_pred, zero_division=0)
 
-        # test metrics
-        yt = model.predict(X_test)
-        test_acc = accuracy_score(y_test, yt)
-
-        summary_rows.append([name, val_acc, test_acc])
-        test_bars.append(test_acc)
-        test_bar_names.append(name)
-
-        # confusion matrices
-        cm_val = confusion_matrix(y_val, yv)
-        cm_test = confusion_matrix(y_test, yt)
-        cm_val_img = plot_confusion_matrix(cm_val, f"Validation Confusion Matrix — {name}")
-        cm_test_img = plot_confusion_matrix(cm_test, f"Test Confusion Matrix — {name}")
-
-        # ROC/PR if proba available
-        roc_img = None
-        pr_img = None
-        if hasattr(model, "predict_proba"):
-            try:
-                yv_prob = model.predict_proba(X_val)[:, 1]
-                fig1, ax1 = plt.subplots(figsize=(4.5, 3.8))
-                RocCurveDisplay.from_predictions(y_val, yv_prob, ax=ax1, name=name)
-                ax1.set_title(f"Validation ROC — {name}")
-                roc_img = fig_to_pil(fig1)
-
-                fig2, ax2 = plt.subplots(figsize=(4.5, 3.8))
-                PrecisionRecallDisplay.from_predictions(y_val, yv_prob, ax=ax2, name=name)
-                ax2.set_title(f"Validation Precision–Recall — {name}")
-                pr_img = fig_to_pil(fig2)
-            except Exception:
-                pass
-
-        # feature importance/coefficients
-        fi_img = plot_feature_importance_or_coef(model, feat_names, f"Features — {name}")
-
-        # store panel
-        panels[name] = {
-            "val_acc": float(val_acc),
-            "test_acc": float(test_acc),
-            "cm_val_img": cm_val_img,
-            "cm_test_img": cm_test_img,
-            "roc_img": roc_img,
-            "pr_img": pr_img,
-            "feat_img": fi_img,
-        }
-
-    # summary markdown
-    df_sum = pd.DataFrame(summary_rows, columns=["Model", "Validation Accuracy", "Test Accuracy"])
-    df_sum = df_sum.sort_values("Test Accuracy", ascending=False).reset_index(drop=True)
-    md_lines = ["### Summary Accuracy Table", "", df_sum.to_markdown(index=False)]
-
-    # overall bar chart
-    bar_img = plot_bar(df_sum["Model"].tolist(), df_sum["Test Accuracy"].tolist(),
-                       "Test Accuracy of Models")
-
-    return "\n".join(md_lines), bar_img, gr.update(choices=df_sum["Model"].tolist(),
-                                                   value=df_sum["Model"].iloc[0]), panels
-
-
-# ---------------------------------------
-# Gradio UI
-# ---------------------------------------
-with gr.Blocks(theme="soft") as demo:
-    gr.Markdown("# 🎓 Thesis Model Dashboard — Reproduce & Show Your Testing")
-    gr.Markdown("Uploads your CSV and runs the exact pipeline (60/20/20 split, random_state=42).")
-
-    with gr.Row():
-        file_in = gr.File(label="Upload dataset CSV", file_types=[".csv"])
-        use_cw = gr.Checkbox(label="Use class_weight='balanced' where supported (helps when one class dominates)",
-                             value=False)
-
-    all_model_names = [
-        "LDA", "AdaBoost", "XGBoost", "RandomForest", "LogisticRegression",
-        "NaiveBayes", "DecisionTree", "SVM", "KNN"
-    ]
-    model_checks = gr.CheckboxGroup(all_model_names, value=["LDA", "RandomForest",
-                                                            "LogisticRegression", "NaiveBayes"],
-                                    label="Models to run")
-
-    run_btn = gr.Button("Run", variant="primary")
-
-    summary_md = gr.Markdown()
-    overall_img = gr.Image(label="Overall Results", height=360)
-    # for the details section
-    model_choice = gr.Dropdown(choices=[], label="Per-Model Details", interactive=True)
-    panel_state = gr.State({})  # holds images/metrics per model
-
-    with gr.Row():
-        # Validation & Test confusion matrices
-        cm_val_out = gr.Image(label="Validation Confusion Matrix")
-        cm_test_out = gr.Image(label="Test Confusion Matrix")
-
-    with gr.Row():
-        roc_out = gr.Image(label="Validation ROC (if supported)")
-        pr_out = gr.Image(label="Validation Precision-Recall (if supported)")
-
-    feat_out = gr.Image(label="Feature Importance / Coefficients (if available)")
-
-    # wire up
-    def _run(file, selected, use_class_weight):
-        # returns summary_md, bar_img, model_choice_update, panels (state)
-        return run_pipeline(file, selected, use_class_weight)
-
-    run_btn.click(
-        _run,
-        inputs=[file_in, model_checks, use_cw],
-        outputs=[summary_md, overall_img, model_choice, panel_state],
-        show_progress="full"
+    summary_md = (
+        f"### LDA Training Summary\n"
+        f"- Train size: **{len(X_train)}**\n"
+        f"- Validation size: **{len(X_val)}**\n"
+        f"- Test size: **{len(X_test)}**\n"
+        f"- Validation Accuracy: **{val_acc:.4f}**\n"
+        f"- Test Accuracy: **{test_acc:.4f}**\n"
     )
 
-    # when selecting a model, pull its images from state
-    def _details(name, panels):
-        if not name or not panels or name not in panels:
-            return None, None, None, None, None
-        p = panels[name]
-        return (
-            f"**{name}** — Val Acc: {p['val_acc']:.3f} | Test Acc: {p['test_acc']:.3f}",
-            p["cm_val_img"],
-            p["cm_test_img"],
-            p["roc_img"],
-            p["pr_img"],
-            p["feat_img"]
+    report_md = "### Test Classification Report\n```text\n" + report + "\n```"
+
+    # Save to global state for prediction tab
+    trained_artifacts["model"] = lda
+    trained_artifacts["feature_cols"] = feat_cols
+    trained_artifacts["income_le"] = income_le
+    trained_artifacts["income_choices"] = income_choices
+
+    # Update income dropdown choices for prediction
+    income_dropdown_update = gr.update(choices=income_choices,
+                                       value=income_choices[0] if income_choices else None)
+
+    return summary_md, cm_img, report_md, income_dropdown_update
+
+
+# -----------------------------
+# 2) Predict single student
+# -----------------------------
+# Use same category labels as in survey
+CONF_OPTIONS = [
+    "Very confident",
+    "Somewhat confident",
+    "Unsure",
+    "Not confident",
+]
+
+ATTEND_OPTIONS = [
+    "Always (0 - 1 absence per month)",
+    "Frequently (2 - 4 absences per month)",
+    "Occasionally (5 - 8 absences per month)",
+    "Rarely (more than 8 absences per month)",
+]
+
+PUNCT_OPTIONS = [
+    "Always on time",
+    "Occasionally late",
+    "Frequently late",
+    "Rarely on time",
+]
+
+ENGAGE_OPTIONS = [
+    "Very engaged",
+    "Moderately engaged",
+    "Slightly engaged",
+    "Not engaged",
+]
+
+STRESS_OPTIONS = [
+    "Always",
+    "Frequently",
+    "Sometimes",
+    "Rarely",
+]
+
+
+def predict_single(
+    age,
+    study_hours_choice,
+    income_cat,
+    confidence,
+    attendance,
+    punctuality,
+    engagement,
+    stress,
+):
+    if trained_artifacts["model"] is None:
+        return "⚠️ Please upload your CSV and train the LDA model first in the other tab."
+
+    lda = trained_artifacts["model"]
+    feat_cols = trained_artifacts["feature_cols"]
+    income_le = trained_artifacts["income_le"]
+
+    # Transform inputs
+    age_val = float(age)
+
+    study_num = study_hours_to_num(study_hours_choice)
+
+    income_proc = str(income_cat).strip().lower()
+    try:
+        income_code = int(income_le.transform([income_proc])[0])
+    except Exception:
+        return "❌ Income category not recognized. Make sure it exists in the uploaded CSV."
+
+    confidence_map = {
+        "very confident": 3,
+        "somewhat confident": 2,
+        "unsure": 1,
+        "not confident": 0,
+    }
+    attendance_map = {
+        "always (0 - 1 absence per month)": 3,
+        "frequently (2 - 4 absences per month)": 2,
+        "occasionally (5 - 8 absences per month)": 1,
+        "rarely (more than 8 absences per month)": 0,
+    }
+    punctuality_map = {
+        "always on time": 3,
+        "occasionally late": 2,
+        "frequently late": 1,
+        "rarely on time": 0,
+    }
+    engagement_map = {
+        "very engaged": 3,
+        "moderately engaged": 2,
+        "slightly engaged": 1,
+        "not engaged": 0,
+    }
+    stress_map = {
+        "always": 3,
+        "frequently": 2,
+        "sometimes": 1,
+        "rarely": 0,
+    }
+
+    conf_code = confidence_map[confidence.lower()]
+    attend_code = attendance_map[attendance.lower()]
+    punct_code = punctuality_map[punctuality.lower()]
+    engage_code = engagement_map[engagement.lower()]
+    stress_code = stress_map[stress.lower()]
+
+    row = pd.DataFrame(
+        [{
+            "Age": age_val,
+            "Study_hours": study_num,
+            "Income_code": income_code,
+            "Confidence_code": conf_code,
+            "Attendance_code": attend_code,
+            "Punctuality_code": punct_code,
+            "Engagement_code": engage_code,
+            "Stress_code": stress_code,
+        }]
+    )[feat_cols]  # ensure same column order
+
+    # Prediction
+    pred = lda.predict(row)[0]
+    if hasattr(lda, "predict_proba"):
+        prob = lda.predict_proba(row)[0, 1]  # probability of Success
+    else:
+        prob = np.nan
+
+    label = "✅ Predicted: **Success (Good/Excellent)**" if pred == 1 else "⚠️ Predicted: **At Risk / Below Good**"
+
+    if np.isnan(prob):
+        prob_txt = ""
+    else:
+        prob_txt = f"\n\nEstimated probability of Success class: **{prob:.2%}**"
+
+    return label + prob_txt
+
+
+# -----------------------------
+# Gradio UI
+# -----------------------------
+with gr.Blocks(title="Thesis LDA Dashboard") as demo:
+    gr.Markdown("## 🎓 Thesis LDA Dashboard — UC Student Performance Prediction")
+
+    with gr.Tab("1️⃣ Train & Evaluate LDA"):
+        file_in = gr.File(label="Upload survey dataset CSV", file_types=[".csv"])
+        train_btn = gr.Button("Run LDA Training & Evaluation", variant="primary")
+
+        summary_md = gr.Markdown()
+        cm_img = gr.Image(label="Test Confusion Matrix (LDA)")
+        report_md = gr.Markdown()
+
+        # hidden output to update income dropdown in other tab
+        income_dd_proxy = gr.Dropdown(visible=False)
+
+        train_btn.click(
+            train_lda,
+            inputs=[file_in],
+            outputs=[summary_md, cm_img, report_md, income_dd_proxy],
         )
 
-    header_md = gr.Markdown()
-    model_choice.change(
-        _details,
-        inputs=[model_choice, panel_state],
-        outputs=[header_md, cm_val_out, cm_test_out, roc_out, pr_out, feat_out]
-    )
+    with gr.Tab("2️⃣ Predict Single Student (LDA System)"):
+        gr.Markdown("Use the trained LDA model to predict **one student's** performance.")
+
+        with gr.Row():
+            age_in = gr.Number(label="Age", value=18)
+            study_hours_in = gr.Dropdown(
+                label="Study hours per week (category)",
+                choices=[
+                    "Less than 5 hours",
+                    "5 - 10 hours",
+                    "11 - 15 hours",
+                    "More than 15 hours",
+                ],
+                value="5 - 10 hours",
+            )
+
+        income_dd = gr.Dropdown(
+            label="Family monthly income (from uploaded CSV)",
+            choices=[],
+            value=None,
+            interactive=True,
+        )
+
+        with gr.Row():
+            conf_dd = gr.Dropdown(label="Confidence", choices=CONF_OPTIONS, value=CONF_OPTIONS[1])
+            attend_dd = gr.Dropdown(label="Frequency of attendance", choices=ATTEND_OPTIONS,
+                                    value=ATTEND_OPTIONS[0])
+
+        with gr.Row():
+            punct_dd = gr.Dropdown(label="Punctuality", choices=PUNCT_OPTIONS, value=PUNCT_OPTIONS[0])
+            engage_dd = gr.Dropdown(label="Class engagement", choices=ENGAGE_OPTIONS,
+                                    value=ENGAGE_OPTIONS[1])
+
+        stress_dd = gr.Dropdown(label="Frequency of stress", choices=STRESS_OPTIONS,
+                                value=STRESS_OPTIONS[2])
+
+        predict_btn = gr.Button("Predict Student Performance", variant="primary")
+        pred_out = gr.Markdown()
+
+        # When we trained, we updated a hidden dropdown; mirror its choices here
+        def sync_income_choices(hidden_dropdown_value, hidden_dropdown_choices):
+            return gr.update(choices=hidden_dropdown_choices,
+                             value=(hidden_dropdown_choices[0] if hidden_dropdown_choices else None))
+
+        income_dd_proxy.change(
+            sync_income_choices,
+            inputs=[income_dd_proxy, income_dd_proxy],
+            outputs=[income_dd],
+        )
+
+        predict_btn.click(
+            predict_single,
+            inputs=[
+                age_in,
+                study_hours_in,
+                income_dd,
+                conf_dd,
+                attend_dd,
+                punct_dd,
+                engage_dd,
+                stress_dd,
+            ],
+            outputs=[pred_out],
+        )
 
 
 if __name__ == "__main__":
-    demo.queue().launch(
-        server_name="0.0.0.0",
-        server_port=int(os.getenv("PORT", "7860")),
-        share=False,
-        inbrowser=False,
-        debug=False
-    )
+    demo.launch(server_name="0.0.0.0", server_port=7860)
