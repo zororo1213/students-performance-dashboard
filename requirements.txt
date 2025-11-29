@@ -3,6 +3,4 @@ pandas
 numpy
 matplotlib
 scikit-learn
-xgboost
 pillow
-tabulate
