@@ -1,9 +1,14 @@
 import warnings
 warnings.filterwarnings("ignore")
 
+# Use a safe backend and built-in font so plots work on Render
+import matplotlib
+matplotlib.use("Agg")
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+plt.rcParams["font.family"] = "DejaVu Sans"
 
 from io import BytesIO
 from PIL import Image
@@ -15,15 +20,16 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
-# -----------------------------
-# Globals to hold trained model
-# -----------------------------
+
+# -------------------------------------------------------------------
+# GLOBAL STATE – holds trained LDA + encoders for the prediction tab
+# -------------------------------------------------------------------
 trained_artifacts = {
     "model": None,
     "feature_cols": None,
     "income_le": None,
-    "income_choices": [],
 }
+
 
 # -----------------------------
 # Plot helpers
@@ -55,6 +61,7 @@ def plot_confusion_matrix(cm, title):
     fig.tight_layout()
     return fig_to_pil(fig)
 
+
 # -----------------------------
 # Preprocessing (matches thesis)
 # -----------------------------
@@ -72,6 +79,7 @@ EXPECTED_COLS = [
 
 
 def study_hours_to_num(x):
+    """Map the survey text ranges to numeric values (same as thesis)."""
     if pd.isna(x):
         return 0
     xx = str(x).lower()
@@ -90,6 +98,15 @@ def study_hours_to_num(x):
 
 
 def preprocess_df(df_raw):
+    """
+    Clean and encode the survey data exactly like in the thesis:
+
+    - Performance: Good/Excellent -> 1, others -> 0
+    - Age: numeric, median imputation
+    - Study hours: text → numeric
+    - Family monthly income: cleaned + LabelEncoder
+    - Confidence, attendance, punctuality, engagement, stress: ordinal codes
+    """
     df = df_raw.copy()
     df.columns = df.columns.str.strip()
 
@@ -102,7 +119,7 @@ def preprocess_df(df_raw):
             + ", ".join(df.columns)
         )
 
-    # Target mapping: Good/Excellent -> 1, others -> 0
+    # Target mapping: Good/Excellent -> 1 (Success), others -> 0 (Below Good)
     def map_performance(perf):
         if isinstance(perf, str) and ("good" in perf.lower() or "excellent" in perf.lower()):
             return 1
@@ -201,9 +218,9 @@ def preprocess_df(df_raw):
 # -----------------------------
 def train_lda(file_obj):
     if file_obj is None:
-        return "Please upload your survey CSV first.", None, "No report yet."
+        return "Please upload your survey CSV first.", None, "No report yet.", gr.update()
 
-    # Load CSV (Render/Gradio sometimes gives .name, sometimes file-like)
+    # Load CSV (handles both .name and file-like object)
     try:
         df = pd.read_csv(file_obj.name)
     except Exception:
@@ -213,9 +230,9 @@ def train_lda(file_obj):
     try:
         X, y, feat_cols, income_le, income_choices = preprocess_df(df)
     except Exception as e:
-        return f"❌ Preprocessing error: {e}", None, "No report due to preprocessing error."
+        return f"❌ Preprocessing error: {e}", None, "No report due to preprocessing error.", gr.update()
 
-    # 60/20/20 stratified split
+    # 60/20/20 stratified split (same as thesis)
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.4, stratify=y, random_state=42
     )
@@ -223,7 +240,7 @@ def train_lda(file_obj):
         X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42
     )
 
-    # Train LDA
+    # Train LDA (your best-performing interpretable model)
     lda = LinearDiscriminantAnalysis()
     lda.fit(X_train, y_train)
 
@@ -254,19 +271,19 @@ def train_lda(file_obj):
     trained_artifacts["model"] = lda
     trained_artifacts["feature_cols"] = feat_cols
     trained_artifacts["income_le"] = income_le
-    trained_artifacts["income_choices"] = income_choices
 
-    # Update income dropdown choices for prediction
-    income_dropdown_update = gr.update(choices=income_choices,
-                                       value=income_choices[0] if income_choices else None)
+    # Update income dropdown choices in prediction tab
+    dd_update = gr.update(
+        choices=income_choices,
+        value=(income_choices[0] if income_choices else None),
+    )
 
-    return summary_md, cm_img, report_md, income_dropdown_update
+    return summary_md, cm_img, report_md, dd_update
 
 
 # -----------------------------
-# 2) Predict single student
+# 2) Predict single student (simple "system")
 # -----------------------------
-# Use same category labels as in survey
 CONF_OPTIONS = [
     "Very confident",
     "Somewhat confident",
@@ -320,8 +337,11 @@ def predict_single(
     feat_cols = trained_artifacts["feature_cols"]
     income_le = trained_artifacts["income_le"]
 
-    # Transform inputs
-    age_val = float(age)
+    # Transform inputs using same logic as preprocess_df
+    try:
+        age_val = float(age)
+    except Exception:
+        return "❌ Age must be a number."
 
     study_num = study_hours_to_num(study_hours_choice)
 
@@ -379,27 +399,23 @@ def predict_single(
             "Engagement_code": engage_code,
             "Stress_code": stress_code,
         }]
-    )[feat_cols]  # ensure same column order
+    )[feat_cols]  # ensure same column order as training
 
-    # Prediction
     pred = lda.predict(row)[0]
+    prob = None
     if hasattr(lda, "predict_proba"):
-        prob = lda.predict_proba(row)[0, 1]  # probability of Success
-    else:
-        prob = np.nan
+        prob = float(lda.predict_proba(row)[0, 1])  # probability of Success class
 
     label = "✅ Predicted: **Success (Good/Excellent)**" if pred == 1 else "⚠️ Predicted: **At Risk / Below Good**"
 
-    if np.isnan(prob):
-        prob_txt = ""
-    else:
-        prob_txt = f"\n\nEstimated probability of Success class: **{prob:.2%}**"
+    if prob is not None:
+        label += f"\n\nEstimated probability of Success class: **{prob:.2%}**"
 
-    return label + prob_txt
+    return label
 
 
 # -----------------------------
-# Gradio UI
+# Gradio UI (two tabs)
 # -----------------------------
 with gr.Blocks(title="Thesis LDA Dashboard") as demo:
     gr.Markdown("## 🎓 Thesis LDA Dashboard — UC Student Performance Prediction")
@@ -411,15 +427,6 @@ with gr.Blocks(title="Thesis LDA Dashboard") as demo:
         summary_md = gr.Markdown()
         cm_img = gr.Image(label="Test Confusion Matrix (LDA)")
         report_md = gr.Markdown()
-
-        # hidden output to update income dropdown in other tab
-        income_dd_proxy = gr.Dropdown(visible=False)
-
-        train_btn.click(
-            train_lda,
-            inputs=[file_in],
-            outputs=[summary_md, cm_img, report_md, income_dd_proxy],
-        )
 
     with gr.Tab("2️⃣ Predict Single Student (LDA System)"):
         gr.Markdown("Use the trained LDA model to predict **one student's** performance.")
@@ -446,45 +453,50 @@ with gr.Blocks(title="Thesis LDA Dashboard") as demo:
 
         with gr.Row():
             conf_dd = gr.Dropdown(label="Confidence", choices=CONF_OPTIONS, value=CONF_OPTIONS[1])
-            attend_dd = gr.Dropdown(label="Frequency of attendance", choices=ATTEND_OPTIONS,
-                                    value=ATTEND_OPTIONS[0])
+            attend_dd = gr.Dropdown(
+                label="Frequency of attendance",
+                choices=ATTEND_OPTIONS,
+                value=ATTEND_OPTIONS[0],
+            )
 
         with gr.Row():
             punct_dd = gr.Dropdown(label="Punctuality", choices=PUNCT_OPTIONS, value=PUNCT_OPTIONS[0])
-            engage_dd = gr.Dropdown(label="Class engagement", choices=ENGAGE_OPTIONS,
-                                    value=ENGAGE_OPTIONS[1])
+            engage_dd = gr.Dropdown(
+                label="Class engagement",
+                choices=ENGAGE_OPTIONS,
+                value=ENGAGE_OPTIONS[1],
+            )
 
-        stress_dd = gr.Dropdown(label="Frequency of stress", choices=STRESS_OPTIONS,
-                                value=STRESS_OPTIONS[2])
+        stress_dd = gr.Dropdown(
+            label="Frequency of stress",
+            choices=STRESS_OPTIONS,
+            value=STRESS_OPTIONS[2],
+        )
 
         predict_btn = gr.Button("Predict Student Performance", variant="primary")
         pred_out = gr.Markdown()
 
-        # When we trained, we updated a hidden dropdown; mirror its choices here
-        def sync_income_choices(hidden_dropdown_value, hidden_dropdown_choices):
-            return gr.update(choices=hidden_dropdown_choices,
-                             value=(hidden_dropdown_choices[0] if hidden_dropdown_choices else None))
+    # Wire callbacks AFTER components are defined
+    train_btn.click(
+        train_lda,
+        inputs=[file_in],
+        outputs=[summary_md, cm_img, report_md, income_dd],
+    )
 
-        income_dd_proxy.change(
-            sync_income_choices,
-            inputs=[income_dd_proxy, income_dd_proxy],
-            outputs=[income_dd],
-        )
-
-        predict_btn.click(
-            predict_single,
-            inputs=[
-                age_in,
-                study_hours_in,
-                income_dd,
-                conf_dd,
-                attend_dd,
-                punct_dd,
-                engage_dd,
-                stress_dd,
-            ],
-            outputs=[pred_out],
-        )
+    predict_btn.click(
+        predict_single,
+        inputs=[
+            age_in,
+            study_hours_in,
+            income_dd,
+            conf_dd,
+            attend_dd,
+            punct_dd,
+            engage_dd,
+            stress_dd,
+        ],
+        outputs=[pred_out],
+    )
 
 
 if __name__ == "__main__":
