@@ -27,7 +27,7 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
 
-# XGBoost is optional but we’ll include it (9th model)
+# XGBoost (optional, 9th model)
 try:
     import xgboost as xgb
     HAS_XGB = True
@@ -324,15 +324,20 @@ def train_and_compare_models(file_obj):
     summary_df = pd.DataFrame(rows, columns=["Model", "Validation Accuracy", "Test Accuracy"])
     summary_df = summary_df.sort_values("Test Accuracy", ascending=False)
 
-    # Bar chart of Test Accuracy for all models
+    # ---- LINE GRAPH of Test Accuracy for all models ----
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.bar(summary_df["Model"], summary_df["Test Accuracy"])
+    ax.plot(
+        summary_df["Model"],
+        summary_df["Test Accuracy"],
+        marker="o",
+        linestyle="-",
+    )
     ax.set_ylim(0, 1)
     ax.set_ylabel("Test Accuracy")
-    ax.set_title("Model Comparison — Test Accuracy")
+    ax.set_title("Model Comparison — Test Accuracy (Line Graph)")
     ax.tick_params(axis="x", rotation=45)
     fig.tight_layout()
-    bar_img = fig_to_pil(fig)
+    line_img = fig_to_pil(fig)
 
     # Markdown summary + table
     summary_md = (
@@ -361,7 +366,7 @@ def train_and_compare_models(file_obj):
         value=(income_cats[0] if income_cats else None),
     )
 
-    return summary_md, bar_img, lda_cm_img, lda_report_md, income_dd_update
+    return summary_md, line_img, lda_cm_img, lda_report_md, income_dd_update
 
 
 # -----------------------------
@@ -516,7 +521,7 @@ with gr.Blocks(title="Thesis Model Dashboard") as demo:
         train_btn = gr.Button("Run Training & Evaluation", variant="primary")
 
         summary_md = gr.Markdown()
-        bar_img = gr.Image(label="Model Comparison — Test Accuracy")
+        line_img = gr.Image(label="Model Comparison — Test Accuracy (Line Graph)")
         lda_cm_img = gr.Image(label="LDA Test Confusion Matrix")
         lda_report_md = gr.Markdown()
 
@@ -576,7 +581,7 @@ with gr.Blocks(title="Thesis Model Dashboard") as demo:
     train_btn.click(
         train_and_compare_models,
         inputs=[file_in],
-        outputs=[summary_md, bar_img, lda_cm_img, lda_report_md, income_dd],
+        outputs=[summary_md, line_img, lda_cm_img, lda_report_md, income_dd],
     )
 
     predict_btn.click(
