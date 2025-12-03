@@ -1,7 +1,7 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-# Safe backend + font so plots work on Render
+# Safe backend + font so plots work on servers like Render
 import matplotlib
 matplotlib.use("Agg")
 
@@ -18,7 +18,7 @@ import gradio as gr
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-# 9 models as in your thesis script
+# 9 models as in your training script
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -150,7 +150,7 @@ def preprocess_df(df_raw):
     df["Study_hours"] = df["Study hours per week"].apply(study_hours_to_num)
 
     # ----- Family monthly income -----
-    # Same idea as your script: clean/normalize, then encode
+    # Clean raw text, also build normalized version for stable codes
     income_raw = (
         df["Family monthly income"]
         .astype(str)
@@ -268,7 +268,7 @@ def build_models():
 
 
 # -----------------------------
-# 1) Train & compare all models (tab 1)
+# 1) Train & compare all models (Tab 1)
 # -----------------------------
 def train_and_compare_models(file_obj):
     if file_obj is None:
@@ -278,6 +278,8 @@ def train_and_compare_models(file_obj):
             None,
             "No report yet.",
             gr.update(choices=[], value=None),
+            gr.update(choices=[], value=None),
+            {},
         )
 
     # Load CSV (works both locally & on Render)
@@ -289,7 +291,7 @@ def train_and_compare_models(file_obj):
 
     X, y, feat_cols, income_cats, income_map = preprocess_df(df)
 
-    # 60/20/20 split (stratified), same as in thesis & script
+    # 60/20/20 split (stratified), same as thesis & script
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.4, stratify=y, random_state=42
     )
@@ -304,6 +306,9 @@ def train_and_compare_models(file_obj):
     lda_report = None
     lda_model = None
 
+    # For per-model details (for dropdown + inner tabs)
+    model_details = {}
+
     for model, name in models:
         if model is None:
             # XGBoost missing case (if HAS_XGB=False)
@@ -312,6 +317,8 @@ def train_and_compare_models(file_obj):
 
         try:
             model.fit(X_train, y_train)
+
+            # Validation & Test predictions
             y_val_pred = model.predict(X_val)
             y_test_pred = model.predict(X_test)
 
@@ -319,12 +326,29 @@ def train_and_compare_models(file_obj):
             test_acc = accuracy_score(y_test, y_test_pred)
             rows.append([name, val_acc, test_acc])
 
-            # Capture LDA details (best model in thesis)
+            # Confusion matrices
+            cm_val = confusion_matrix(y_val, y_val_pred)
+            cm_test = confusion_matrix(y_test, y_test_pred)
+
+            # Convert to images (for tabs)
+            cm_val_img = plot_confusion_matrix(cm_val, f"Validation Confusion Matrix — {name}")
+            cm_test_img = plot_confusion_matrix(cm_test, f"Test Confusion Matrix — {name}")
+
+            # Test classification report
+            rep_test = classification_report(y_test, y_test_pred, zero_division=0)
+
+            model_details[name] = {
+                "cm_val": cm_val_img,
+                "cm_test": cm_test_img,
+                "report_test": rep_test,
+            }
+
+            # Capture LDA details for top-level display + prediction tab
             if name == "LDA":
-                cm = confusion_matrix(y_test, y_test_pred)
-                lda_cm_img = plot_confusion_matrix(cm, "Test Confusion Matrix — LDA")
-                lda_report = classification_report(y_test, y_test_pred, zero_division=0)
+                lda_cm_img = cm_test_img
+                lda_report = rep_test
                 lda_model = model
+
         except Exception:
             rows.append([name, np.nan, np.nan])
 
@@ -373,11 +397,18 @@ def train_and_compare_models(file_obj):
         value=(income_cats[0] if income_cats else None),
     )
 
-    return summary_md, line_img, lda_cm_img, lda_report_md, income_dd_update
+    # Model selector dropdown options
+    model_names = summary_df["Model"].tolist()
+    model_dd_update = gr.update(
+        choices=model_names,
+        value=(model_names[0] if model_names else None) if model_names else None,
+    )
+
+    return summary_md, line_img, lda_cm_img, lda_report_md, income_dd_update, model_dd_update, model_details
 
 
 # -----------------------------
-# 2) Predict single student using LDA only (tab 2)
+# 2) Predict single student using LDA only (Tab 2)
 # -----------------------------
 CONF_OPTIONS = [
     "Very confident",
@@ -517,10 +548,25 @@ def predict_single(
 
 
 # -----------------------------
+# 3) Per-model detail renderer for Tab 1 dropdown
+# -----------------------------
+def show_model_details(model_name, model_details):
+    if not model_name or not model_details or model_name not in model_details:
+        return None, None, "Select a model above to view its confusion matrices and classification report."
+
+    info = model_details[model_name]
+    rep_text = info["report_test"]
+    rep_md = "```text\n" + rep_text + "\n```"
+    return info["cm_val"], info["cm_test"], rep_md
+
+
+# -----------------------------
 # Gradio UI
 # -----------------------------
 with gr.Blocks(title="Thesis Model Dashboard") as demo:
     gr.Markdown("## 🎓 Thesis Model Dashboard — UC Student Performance Prediction")
+
+    model_details_state = gr.State({})
 
     # TAB 1: training + comparison of 9 models
     with gr.Tab("1️⃣ Train & Compare Models"):
@@ -531,6 +577,23 @@ with gr.Blocks(title="Thesis Model Dashboard") as demo:
         line_img = gr.Image(label="Model Comparison — Test Accuracy (Line Graph)")
         lda_cm_img = gr.Image(label="LDA Test Confusion Matrix")
         lda_report_md = gr.Markdown()
+
+        gr.Markdown("### 🔍 Per-Model Detailed Results")
+
+        model_select = gr.Dropdown(
+            label="Select model",
+            choices=[],
+            value=None,
+            interactive=True,
+        )
+
+        with gr.Tabs():
+            with gr.Tab("Validation Confusion Matrix"):
+                cm_val_img = gr.Image(label="Validation Confusion Matrix")
+            with gr.Tab("Test Confusion Matrix"):
+                cm_test_img = gr.Image(label="Test Confusion Matrix")
+            with gr.Tab("Test Classification Report"):
+                test_report_md = gr.Markdown()
 
     # TAB 2: prediction system (LDA only)
     with gr.Tab("2️⃣ Predict Single Student (LDA System)"):
@@ -588,7 +651,21 @@ with gr.Blocks(title="Thesis Model Dashboard") as demo:
     train_btn.click(
         train_and_compare_models,
         inputs=[file_in],
-        outputs=[summary_md, line_img, lda_cm_img, lda_report_md, income_dd],
+        outputs=[
+            summary_md,
+            line_img,
+            lda_cm_img,
+            lda_report_md,
+            income_dd,
+            model_select,
+            model_details_state,
+        ],
+    )
+
+    model_select.change(
+        show_model_details,
+        inputs=[model_select, model_details_state],
+        outputs=[cm_val_img, cm_test_img, test_report_md],
     )
 
     predict_btn.click(
