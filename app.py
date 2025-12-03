@@ -18,7 +18,7 @@ import gradio as gr
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-# 9 models as in your thesis
+# 9 models as in your thesis script
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -27,7 +27,7 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
 
-# XGBoost (optional, 9th model)
+# XGBoost (9th model)
 try:
     import xgboost as xgb
     HAS_XGB = True
@@ -78,7 +78,7 @@ def plot_confusion_matrix(cm, title):
 
 
 # -----------------------------
-# Preprocessing (aligned to thesis)
+# Preprocessing – mirrors your script
 # -----------------------------
 EXPECTED_COLS = [
     "Age",
@@ -94,7 +94,7 @@ EXPECTED_COLS = [
 
 
 def study_hours_to_num(x):
-    """Convert survey text ranges to numeric values (same mapping as thesis)."""
+    """Convert survey text ranges to numeric values (same mapping as script)."""
     if pd.isna(x):
         return 0
     xx = str(x).lower()
@@ -114,12 +114,12 @@ def study_hours_to_num(x):
 
 def preprocess_df(df_raw):
     """
-    Clean and encode the survey data:
+    Clean and encode the survey data, aligned with your training code:
 
     - Performance: Good/Excellent -> 1, others -> 0
     - Age: numeric, median imputation
     - Study hours: text → numeric
-    - Family monthly income: create stable integer codes + display strings
+    - Family monthly income: normalized + stable integer codes
     - Confidence, attendance, punctuality, engagement, stress: ordinal codes
     """
     df = df_raw.copy()
@@ -150,7 +150,7 @@ def preprocess_df(df_raw):
     df["Study_hours"] = df["Study hours per week"].apply(study_hours_to_num)
 
     # ----- Family monthly income -----
-    # Keep original display text + normalized lower-case version
+    # Same idea as your script: clean/normalize, then encode
     income_raw = (
         df["Family monthly income"]
         .astype(str)
@@ -159,7 +159,6 @@ def preprocess_df(df_raw):
     )
     income_norm = income_raw.str.lower()
 
-    # Create stable integer codes from normalized values
     unique_norm = sorted(income_norm.unique())
     income_map_norm = {cat: idx for idx, cat in enumerate(unique_norm)}
     df["Income_code"] = income_norm.map(income_map_norm)
@@ -181,12 +180,12 @@ def preprocess_df(df_raw):
     df["Confidence"] = df["Confidence"].astype(str).str.lower()
     df["Confidence_code"] = df["Confidence"].map(confidence_map).fillna(1)
 
-    # ----- Frequency of attendance -----
+    # ----- Frequency of attendance (match your script wording) -----
     attendance_map = {
         "always (0 - 1 absence per month)": 3,
         "frequently (2 - 4 absences per month)": 2,
-        "occasionally (5 - 8 absences per month)": 1,
-        "rarely (more than 8 absences per month)": 0,
+        "sometimes (5 - 7 absences per month)": 1,
+        "rarely (more than 7 absences per month)": 0,
     }
     df["Frequency of attendance"] = df["Frequency of attendance"].astype(str).str.lower()
     df["Attendance_code"] = df["Frequency of attendance"].map(attendance_map).fillna(1)
@@ -239,29 +238,32 @@ def preprocess_df(df_raw):
 
 
 # -----------------------------
-# Build all 9 models
+# Build all 9 models (same list as script)
 # -----------------------------
 def build_models():
-    models = {
-        "LDA": LinearDiscriminantAnalysis(),
-        "Logistic Regression": LogisticRegression(max_iter=2000, random_state=42),
-        "Random Forest": RandomForestClassifier(random_state=42, n_estimators=300),
-        "AdaBoost": AdaBoostClassifier(random_state=42),
-        "Naive Bayes": GaussianNB(),
-        "Decision Tree": DecisionTreeClassifier(random_state=42),
-        "SVM": SVC(probability=True, random_state=42),
-        "KNN": KNeighborsClassifier(),
-    }
-    if HAS_XGB:
-        models["XGBoost"] = xgb.XGBClassifier(
-            eval_metric="logloss",
-            random_state=42,
-            n_estimators=200,
-            max_depth=3,
-            learning_rate=0.1,
-            subsample=0.9,
-            colsample_bytree=0.9,
+    models = [
+        (LinearDiscriminantAnalysis(), "LDA"),
+        (AdaBoostClassifier(random_state=42), "AdaBoost"),
+        (
+            xgb.XGBClassifier(
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42,
+            ),
+            "XGBoost",
         )
+        if HAS_XGB
+        else (None, "XGBoost"),
+        (RandomForestClassifier(random_state=42, n_estimators=300), "RandomForest"),
+        (LogisticRegression(max_iter=1000, random_state=42), "LogisticRegression"),
+        (GaussianNB(), "NaiveBayes"),
+        (DecisionTreeClassifier(random_state=42), "DecisionTree"),
+        (SVC(probability=True, random_state=42), "SVM"),
+        (KNeighborsClassifier(), "KNN"),
+    ]
+    # Filter out XGBoost if not available
+    if not HAS_XGB:
+        models = [m for m in models if m[1] != "XGBoost"]
     return models
 
 
@@ -287,7 +289,7 @@ def train_and_compare_models(file_obj):
 
     X, y, feat_cols, income_cats, income_map = preprocess_df(df)
 
-    # 60/20/20 split (stratified), same as in thesis
+    # 60/20/20 split (stratified), same as in thesis & script
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.4, stratify=y, random_state=42
     )
@@ -302,23 +304,28 @@ def train_and_compare_models(file_obj):
     lda_report = None
     lda_model = None
 
-    for name, model in models.items():
+    for model, name in models:
+        if model is None:
+            # XGBoost missing case (if HAS_XGB=False)
+            rows.append([name, np.nan, np.nan])
+            continue
+
         try:
             model.fit(X_train, y_train)
             y_val_pred = model.predict(X_val)
             y_test_pred = model.predict(X_test)
+
             val_acc = accuracy_score(y_val, y_val_pred)
             test_acc = accuracy_score(y_test, y_test_pred)
             rows.append([name, val_acc, test_acc])
 
-            # Save extra details for LDA (best model in thesis)
+            # Capture LDA details (best model in thesis)
             if name == "LDA":
                 cm = confusion_matrix(y_test, y_test_pred)
                 lda_cm_img = plot_confusion_matrix(cm, "Test Confusion Matrix — LDA")
                 lda_report = classification_report(y_test, y_test_pred, zero_division=0)
                 lda_model = model
         except Exception:
-            # If a model fails (e.g., xgboost not installed properly), mark as NaN
             rows.append([name, np.nan, np.nan])
 
     summary_df = pd.DataFrame(rows, columns=["Model", "Validation Accuracy", "Test Accuracy"])
@@ -339,7 +346,7 @@ def train_and_compare_models(file_obj):
     fig.tight_layout()
     line_img = fig_to_pil(fig)
 
-    # Markdown summary + table
+    # Markdown summary + table (like your Summary Accuracy Table)
     summary_md = (
         f"### Train / Validation / Test Split\n"
         f"- Train size: **{len(X_train)}**\n"
@@ -382,8 +389,8 @@ CONF_OPTIONS = [
 ATTEND_OPTIONS = [
     "Always (0 - 1 absence per month)",
     "Frequently (2 - 4 absences per month)",
-    "Occasionally (5 - 8 absences per month)",
-    "Rarely (more than 8 absences per month)",
+    "Sometimes (5 - 7 absences per month)",
+    "Rarely (more than 7 absences per month)",
 ]
 
 PUNCT_OPTIONS = [
@@ -452,8 +459,8 @@ def predict_single(
     attendance_map = {
         "always (0 - 1 absence per month)": 3,
         "frequently (2 - 4 absences per month)": 2,
-        "occasionally (5 - 8 absences per month)": 1,
-        "rarely (more than 8 absences per month)": 0,
+        "sometimes (5 - 7 absences per month)": 1,
+        "rarely (more than 7 absences per month)": 0,
     }
     punctuality_map = {
         "always on time": 3,
@@ -577,7 +584,7 @@ with gr.Blocks(title="Thesis Model Dashboard") as demo:
         predict_btn = gr.Button("Predict Student Performance", variant="primary")
         pred_out = gr.Markdown()
 
-    # Wire up
+    # Wire up callbacks
     train_btn.click(
         train_and_compare_models,
         inputs=[file_in],
